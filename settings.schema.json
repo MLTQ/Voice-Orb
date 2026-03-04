@@ -110,6 +110,13 @@
       "default_value": false
     },
     {
+      "key": "auto_play_generated_audio",
+      "title": "Auto-play Generated Audio",
+      "kind": "boolean",
+      "help": "Automatically play newly generated Voice-Orb audio clips when they appear in chat.",
+      "default_value": false
+    },
+    {
       "key": "max_new_tokens",
       "title": "Max New Tokens",
       "kind": "number",
