@@ -1,0 +1,143 @@
+{
+  "fields": [
+    {
+      "key": "enabled",
+      "title": "Enabled",
+      "kind": "boolean",
+      "help": "Start the Voice-Orb plugin when Ponderer boots.",
+      "default_value": false
+    },
+    {
+      "key": "model_ref",
+      "title": "Model",
+      "kind": "text",
+      "help": "Hugging Face model id or local model directory. VoiceDesign should use a VoiceDesign checkpoint.",
+      "required": true,
+      "default_value": "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
+    },
+    {
+      "key": "cache_dir",
+      "title": "Model Cache",
+      "kind": "path",
+      "help": "Portable local cache for downloaded model weights.",
+      "default_value": "./data/models"
+    },
+    {
+      "key": "output_dir",
+      "title": "Output Folder",
+      "kind": "path",
+      "help": "Where generated audio files are written.",
+      "default_value": "./data/output"
+    },
+    {
+      "key": "device",
+      "title": "Device",
+      "kind": "select",
+      "help": "Inference target device.",
+      "default_value": "auto",
+      "options": [
+        { "value": "auto", "label": "Auto" },
+        { "value": "cuda", "label": "CUDA" },
+        { "value": "mps", "label": "Apple MPS" },
+        { "value": "cpu", "label": "CPU" }
+      ]
+    },
+    {
+      "key": "dtype",
+      "title": "Precision",
+      "kind": "select",
+      "help": "Torch dtype used when loading the model.",
+      "default_value": "auto",
+      "options": [
+        { "value": "auto", "label": "Auto" },
+        { "value": "bfloat16", "label": "bfloat16" },
+        { "value": "float16", "label": "float16" },
+        { "value": "float32", "label": "float32" }
+      ]
+    },
+    {
+      "key": "attention_impl",
+      "title": "Attention",
+      "kind": "select",
+      "help": "Attention backend. Flash Attention can reduce VRAM if supported.",
+      "default_value": "auto",
+      "options": [
+        { "value": "auto", "label": "Auto" },
+        { "value": "flash_attention_2", "label": "FlashAttention2" },
+        { "value": "sdpa", "label": "SDPA" },
+        { "value": "eager", "label": "Eager" }
+      ]
+    },
+    {
+      "key": "language",
+      "title": "Default Language",
+      "kind": "select",
+      "help": "Passed to Qwen3-TTS when no per-call language override is supplied.",
+      "default_value": "Auto",
+      "options": [
+        { "value": "Auto", "label": "Auto" },
+        { "value": "Chinese", "label": "Chinese" },
+        { "value": "English", "label": "English" },
+        { "value": "Japanese", "label": "Japanese" },
+        { "value": "Korean", "label": "Korean" },
+        { "value": "German", "label": "German" },
+        { "value": "French", "label": "French" },
+        { "value": "Russian", "label": "Russian" },
+        { "value": "Portuguese", "label": "Portuguese" },
+        { "value": "Spanish", "label": "Spanish" },
+        { "value": "Italian", "label": "Italian" }
+      ]
+    },
+    {
+      "key": "default_voice_description",
+      "title": "Default Voice Description",
+      "kind": "multiline",
+      "help": "Base VoiceDesign prompt used when a tool call does not supply one.",
+      "default_value": "Warm, articulate, steady, emotionally grounded, with clear diction and a calm cadence."
+    },
+    {
+      "key": "allow_persona_drift",
+      "title": "Persona Drift",
+      "kind": "boolean",
+      "help": "Let persona-evolution events subtly influence the active voice description.",
+      "default_value": true
+    },
+    {
+      "key": "auto_speak_replies",
+      "title": "Auto Speak Replies",
+      "kind": "boolean",
+      "help": "Expose guidance that the agent may speak completed replies when useful. This does not force playback by itself.",
+      "default_value": false
+    },
+    {
+      "key": "max_new_tokens",
+      "title": "Max New Tokens",
+      "kind": "number",
+      "default_value": 2048
+    },
+    {
+      "key": "top_p",
+      "title": "Top P",
+      "kind": "number",
+      "default_value": 0.9
+    },
+    {
+      "key": "top_k",
+      "title": "Top K",
+      "kind": "number",
+      "default_value": 50
+    },
+    {
+      "key": "temperature",
+      "title": "Temperature",
+      "kind": "number",
+      "default_value": 0.7
+    },
+    {
+      "key": "repetition_penalty",
+      "title": "Repetition Penalty",
+      "kind": "number",
+      "default_value": 1.1
+    }
+  ]
+}

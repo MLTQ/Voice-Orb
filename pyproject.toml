@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "voice-orb"
+version = "0.1.0"
+description = "Portable Qwen3-TTS runtime plugin for Ponderer"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "qwen-tts",
+  "soundfile",
+]
+
+[tool.setuptools]
+packages = ["voice_orb"]

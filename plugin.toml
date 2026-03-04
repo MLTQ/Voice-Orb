@@ -1,0 +1,9 @@
+id = "voice-orb"
+name = "Voice-Orb"
+version = "0.1.0"
+description = "Portable Qwen3-TTS VoiceDesign runtime plugin for Ponderer."
+plugin_type = "runtime_process"
+command = ["./scripts/run_plugin.sh"]
+settings_schema_file = "settings.schema.json"
+settings_tab_title = "Voice-Orb"
+settings_tab_order = 320
