@@ -18,7 +18,7 @@ Implements the `Voice-Orb` stdio JSON-RPC server for Ponderer. It loads Qwen3-TT
 - **Interacts with**: Ponderer tool-proxy registration.
 
 ### `synthesize` / `load_model`
-- **Does**: Lazily import audio/model dependencies, load the configured Qwen3-TTS VoiceDesign model, generate audio with `generate_voice_design`, and write `.wav` output into the portable plugin output folder.
+- **Does**: Lazily import audio/model dependencies, load the configured Qwen3-TTS VoiceDesign model with explicit device/dtype strategy, detect meta-tensor loads, and generate audio with `generate_voice_design` (including one-shot fallback reload on meta-tensor runtime failures) before writing `.wav` output into the portable plugin output folder.
 - **Interacts with**: `qwen_tts.Qwen3TTSModel`, `soundfile`, plugin-local `data/`.
 
 ## Contracts
@@ -32,4 +32,5 @@ Implements the `Voice-Orb` stdio JSON-RPC server for Ponderer. It loads Qwen3-TT
 ## Notes
 - `soundfile`, `torch`, and `qwen-tts` are all imported lazily so the handshake path stays lightweight and less likely to emit startup noise before JSON-RPC begins.
 - The model is loaded lazily on first synthesis or `voice_orb_ensure_model`.
+- Auto device mode now resolves to a concrete backend (`cuda:0` -> `mps` -> `cpu`) instead of relying on `device_map="auto"`, and CPU fallback is used automatically if meta tensors are detected.
 - The implementation intentionally targets the official `VoiceDesign` mode only for now; `CustomVoice` and cloning can be added later as separate tool paths.

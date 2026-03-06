@@ -138,7 +138,9 @@ def handshake() -> dict[str, Any]:
                 "name": "voice_orb_speak",
                 "description": (
                     "Generate speech using Qwen3-TTS VoiceDesign from text "
-                    "and a natural-language voice description."
+                    "and a natural-language voice description. "
+                    "The generated audio is automatically published to chat — "
+                    "do NOT call publish_media_to_chat afterward."
                 ),
                 "parameters": tool_schema,
                 "requires_approval": False,
@@ -148,7 +150,9 @@ def handshake() -> dict[str, Any]:
                 "name": "voice_orb_preview",
                 "description": (
                     "Generate a short preview clip using the current or supplied "
-                    "VoiceDesign voice description."
+                    "VoiceDesign voice description. "
+                    "The generated audio is automatically published to chat — "
+                    "do NOT call publish_media_to_chat afterward."
                 ),
                 "parameters": tool_schema,
                 "requires_approval": False,
@@ -291,12 +295,31 @@ def synthesize(arguments: dict[str, Any], preview: bool) -> dict[str, Any]:
     if seed_value is not None:
         generation_kwargs["seed"] = int(seed_value)
 
-    wavs, sample_rate = model.generate_voice_design(
-        text=text,
-        language=language,
-        instruct=voice_description,
-        **generation_kwargs,
-    )
+    try:
+        wavs, sample_rate = model.generate_voice_design(
+            text=text,
+            language=language,
+            instruct=voice_description,
+            **generation_kwargs,
+        )
+    except RuntimeError as exc:
+        # Some environments can resolve a partially materialized model (meta tensors).
+        # Retry once with an explicit safe fallback load strategy.
+        if "meta tensor" not in str(exc).lower():
+            raise
+        print(
+            "Voice-Orb: detected meta-tensor generation failure; retrying with safe fallback load.",
+            file=sys.stderr,
+        )
+        STATE.loaded_model = None
+        STATE.loaded_model_ref = None
+        model = load_model(force_fallback=True)
+        wavs, sample_rate = model.generate_voice_design(
+            text=text,
+            language=language,
+            instruct=voice_description,
+            **generation_kwargs,
+        )
 
     audio = wavs[0]
     output_dir = ensure_directory(resolve_repo_path(str(settings.get("output_dir") or "./data/output")))
@@ -328,14 +351,18 @@ def synthesize(arguments: dict[str, Any], preview: bool) -> dict[str, Any]:
     }
 
 
-def load_model() -> Any:
+def load_model(force_fallback: bool = False) -> Any:
     settings = STATE.merged_settings()
     model_ref = str(settings.get("model_ref") or "").strip()
     if not model_ref:
         raise ValueError("model_ref is required")
     torch_module, model_class = ensure_qwen_runtime()
 
-    if STATE.loaded_model is not None and STATE.loaded_model_ref == model_ref:
+    if (
+        not force_fallback
+        and STATE.loaded_model is not None
+        and STATE.loaded_model_ref == model_ref
+    ):
         return STATE.loaded_model
 
     cache_dir = ensure_directory(resolve_repo_path(str(settings.get("cache_dir") or "./data/models")))
@@ -343,31 +370,34 @@ def load_model() -> Any:
     os.environ["HF_HUB_CACHE"] = str(cache_dir)
     os.environ["TRANSFORMERS_CACHE"] = str(cache_dir)
 
-    kwargs: dict[str, Any] = {}
-    device = str(settings.get("device") or "auto").strip().lower()
-    if device == "auto":
-        kwargs["device_map"] = "auto"
-    elif device == "cuda":
-        kwargs["device_map"] = "cuda:0"
-    else:
-        kwargs["device_map"] = device
-
-    dtype_name = str(settings.get("dtype") or "auto").strip().lower()
-    if dtype_name != "auto":
-        dtype_map = {
-            "bfloat16": torch_module.bfloat16,
-            "float16": torch_module.float16,
-            "float32": torch_module.float32,
-        }
-        kwargs["dtype"] = dtype_map.get(dtype_name, torch_module.float32)
-
-    attention_impl = str(settings.get("attention_impl") or "auto").strip()
-    if attention_impl and attention_impl != "auto":
-        kwargs["attn_implementation"] = attention_impl
+    kwargs = build_model_load_kwargs(settings, torch_module, force_fallback=force_fallback)
 
     model_source = resolve_model_source(model_ref)
-    with contextlib.redirect_stdout(sys.stderr):
-        STATE.loaded_model = model_class.from_pretrained(model_source, **kwargs)
+    try:
+        with contextlib.redirect_stdout(sys.stderr):
+            loaded_model = model_class.from_pretrained(model_source, **kwargs)
+    except RuntimeError as exc:
+        if "meta tensor" not in str(exc).lower() or force_fallback:
+            raise
+        print(
+            "Voice-Orb: meta-tensor error during model load; retrying with safe fallback strategy.",
+            file=sys.stderr,
+        )
+        return load_model(force_fallback=True)
+
+    if model_has_meta_tensors(loaded_model):
+        if force_fallback:
+            raise RuntimeError(
+                "Voice-Orb model resolved with meta tensors even in fallback mode. "
+                "Try CPU + float32, reinstall dependencies, or clear model cache."
+            )
+        print(
+            "Voice-Orb: model loaded with meta tensors; retrying with safe fallback strategy.",
+            file=sys.stderr,
+        )
+        return load_model(force_fallback=True)
+
+    STATE.loaded_model = loaded_model
     STATE.loaded_model_ref = model_ref
     return STATE.loaded_model
 
@@ -395,6 +425,82 @@ def ensure_qwen_runtime() -> tuple[Any, Any]:
     STATE.torch_module = torch_module
     STATE.model_class = model_class
     return torch_module, model_class
+
+
+def build_model_load_kwargs(
+    settings: dict[str, Any], torch_module: Any, force_fallback: bool
+) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {}
+
+    if force_fallback:
+        kwargs["device_map"] = {"": "cpu"}
+        kwargs["dtype"] = torch_module.float32
+        kwargs["attn_implementation"] = "eager"
+        kwargs["low_cpu_mem_usage"] = False
+        return kwargs
+
+    device_target = resolve_effective_device(settings, torch_module)
+    kwargs["device_map"] = {"": device_target}
+    kwargs["low_cpu_mem_usage"] = False
+
+    dtype_name = str(settings.get("dtype") or "auto").strip().lower()
+    if dtype_name != "auto":
+        dtype_map = {
+            "bfloat16": torch_module.bfloat16,
+            "float16": torch_module.float16,
+            "float32": torch_module.float32,
+        }
+        kwargs["dtype"] = dtype_map.get(dtype_name, torch_module.float32)
+    elif device_target in {"cpu", "mps"}:
+        # Auto dtype on non-CUDA backends can be unstable depending on env.
+        kwargs["dtype"] = torch_module.float32
+
+    attention_impl = str(settings.get("attention_impl") or "auto").strip()
+    if attention_impl and attention_impl != "auto":
+        kwargs["attn_implementation"] = attention_impl
+
+    return kwargs
+
+
+def resolve_effective_device(settings: dict[str, Any], torch_module: Any) -> str:
+    configured = str(settings.get("device") or "auto").strip().lower()
+    if configured and configured != "auto":
+        if configured == "cuda":
+            return "cuda:0"
+        return configured
+
+    if torch_module.cuda.is_available():
+        return "cuda:0"
+
+    mps_backend = getattr(getattr(torch_module, "backends", None), "mps", None)
+    if mps_backend is not None and mps_backend.is_available():
+        return "mps"
+
+    return "cpu"
+
+
+def model_has_meta_tensors(model: Any) -> bool:
+    for candidate in iter_candidate_modules(model):
+        parameters = getattr(candidate, "parameters", None)
+        if not callable(parameters):
+            continue
+        try:
+            for parameter in parameters():
+                device = getattr(parameter, "device", None)
+                if getattr(device, "type", None) == "meta":
+                    return True
+        except Exception:
+            continue
+    return False
+
+
+def iter_candidate_modules(model: Any) -> list[Any]:
+    candidates: list[Any] = [model]
+    for attribute in ("model", "tts_model", "inner_model"):
+        nested = getattr(model, attribute, None)
+        if nested is not None:
+            candidates.append(nested)
+    return candidates
 
 
 def ensure_soundfile() -> Any:
