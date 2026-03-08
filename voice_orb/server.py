@@ -3,6 +3,7 @@ import os
 import sys
 import contextlib
 import gc
+import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,16 +12,24 @@ from typing import Any
 from voice_orb import __version__
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_MAX_NEW_TOKENS = 640
+DEFAULT_MAX_NEW_TOKENS = 384
 MIN_MAX_NEW_TOKENS = 64
 MAX_MAX_NEW_TOKENS = 1024
-PREVIEW_MAX_NEW_TOKENS = 320
+PREVIEW_MAX_NEW_TOKENS = 192
+DEFAULT_MAX_INPUT_CHARS = 900
+DEFAULT_MAX_RSS_MB = 14_000
 
 
 @dataclass
 class PluginState:
     settings: dict[str, Any] = field(default_factory=dict)
     persona_hint: str = ""
+    instance_id: str = field(
+        default_factory=lambda: f"voice-orb-{os.getpid()}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}"
+    )
+    startup_utc: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    model_load_count: int = 0
+    last_loaded_utc: str | None = None
     loaded_model_ref: str | None = None
     loaded_model: Any | None = None
     torch_module: Any | None = None
@@ -43,7 +52,10 @@ class PluginState:
             ),
             "allow_persona_drift": True,
             "auto_speak_replies": False,
-            "unload_after_synthesis": True,
+            "allow_cpu_fallback": False,
+            "unload_after_synthesis": False,
+            "max_input_chars": DEFAULT_MAX_INPUT_CHARS,
+            "max_rss_mb": DEFAULT_MAX_RSS_MB,
             "max_new_tokens": DEFAULT_MAX_NEW_TOKENS,
             "top_p": 0.9,
             "top_k": 50,
@@ -132,7 +144,7 @@ def handshake() -> dict[str, Any]:
         "name": "Voice-Orb",
         "version": __version__,
         "capabilities": {
-            "tools": ["voice_orb_speak", "voice_orb_preview", "voice_orb_ensure_model"],
+            "tools": ["voice_orb_speak", "voice_orb_preview"],
             "event_hooks": ["persona_evolved", "settings_changed"],
             "prompt_slots": [
                 "engaged.instructions",
@@ -161,19 +173,6 @@ def handshake() -> dict[str, Any]:
                     "do NOT call publish_media_to_chat afterward."
                 ),
                 "parameters": tool_schema,
-                "requires_approval": False,
-                "category": "general",
-            },
-            {
-                "name": "voice_orb_ensure_model",
-                "description": (
-                    "Load the configured Qwen3-TTS VoiceDesign model, downloading "
-                    "weights into the local plugin cache if needed."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {}
-                },
                 "requires_approval": False,
                 "category": "general",
             },
@@ -256,18 +255,7 @@ def invoke_tool(params: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("plugin.invoke_tool arguments must be an object")
 
     if tool_name == "voice_orb_ensure_model":
-        model = load_model()
-        runtime_device, runtime_dtype = resolve_runtime_backend(model)
-        return {
-            "kind": "json",
-            "data": {
-                "status": "ok",
-                "model_ref": STATE.loaded_model_ref,
-                "model_loaded": model is not None,
-                "runtime_device": runtime_device,
-                "runtime_dtype": runtime_dtype,
-            },
-        }
+        return ensure_model_status(arguments)
 
     if tool_name == "voice_orb_preview":
         arguments = dict(arguments)
@@ -281,12 +269,62 @@ def invoke_tool(params: dict[str, Any]) -> dict[str, Any]:
     raise ValueError(f"unknown tool: {tool_name}")
 
 
+def ensure_model_status(arguments: dict[str, Any]) -> dict[str, Any]:
+    preload = coerce_bool(arguments.get("preload"), False)
+    configured_model_ref = current_configured_model_ref()
+    already_loaded = is_model_loaded_for_ref(configured_model_ref)
+
+    if preload and not already_loaded:
+        model = load_model()
+        runtime_device, runtime_dtype = resolve_runtime_backend(model)
+        return {
+            "kind": "json",
+            "data": {
+                "status": "ok",
+                "action": "preloaded",
+                "model_ref": STATE.loaded_model_ref,
+                "model_loaded": model is not None,
+                "runtime_device": runtime_device,
+                "runtime_dtype": runtime_dtype,
+                **runtime_status_fields(),
+            },
+        }
+
+    model = STATE.loaded_model
+    runtime_device, runtime_dtype = resolve_runtime_backend(model)
+    return {
+        "kind": "json",
+        "data": {
+            "status": "ok",
+            "action": "status_only",
+            "model_ref": STATE.loaded_model_ref,
+            "configured_model_ref": configured_model_ref,
+            "model_loaded": model is not None,
+            "already_loaded": already_loaded,
+            "runtime_device": runtime_device,
+            "runtime_dtype": runtime_dtype,
+            **runtime_status_fields(),
+        },
+    }
+
+
 def synthesize(arguments: dict[str, Any], preview: bool) -> dict[str, Any]:
     text = str(arguments.get("text") or "").strip()
     if not text:
         raise ValueError("text is required")
 
     settings = STATE.merged_settings()
+    configured_model_ref = current_configured_model_ref()
+    already_loaded_before_call = is_model_loaded_for_ref(configured_model_ref)
+    text, input_was_truncated = bound_input_text(text, settings)
+    rss_before_mb = current_rss_mb()
+    max_rss_mb = resolve_max_rss_mb(settings)
+    if rss_before_mb is not None and rss_before_mb >= max_rss_mb:
+        unload_loaded_model()
+        raise RuntimeError(
+            f"Voice-Orb refused synthesis because process RSS is already high "
+            f"({rss_before_mb:.0f}MB >= budget {max_rss_mb:.0f}MB)."
+        )
     soundfile_module = ensure_soundfile()
     voice_description = str(
         arguments.get("voice_description")
@@ -297,7 +335,7 @@ def synthesize(arguments: dict[str, Any], preview: bool) -> dict[str, Any]:
 
     model = load_model()
     runtime_device, runtime_dtype = resolve_runtime_backend(model)
-    should_unload_after_synthesis = bool(settings.get("unload_after_synthesis", True))
+    should_unload_after_synthesis = bool(settings.get("unload_after_synthesis", False))
 
     generation_kwargs: dict[str, Any] = {
         "max_new_tokens": resolve_max_new_tokens(settings, preview),
@@ -313,6 +351,8 @@ def synthesize(arguments: dict[str, Any], preview: bool) -> dict[str, Any]:
     sample_rate = None
     output_path = None
     output_name = None
+    rss_after_mb = None
+    budget_exceeded = False
     try:
         try:
             wavs, sample_rate = generate_voice_design(
@@ -327,10 +367,13 @@ def synthesize(arguments: dict[str, Any], preview: bool) -> dict[str, Any]:
             # Retry once with an explicit safe fallback load strategy.
             if "meta tensor" not in str(exc).lower():
                 raise
-            print(
-                "Voice-Orb: detected meta-tensor generation failure; retrying with safe fallback load.",
-                file=sys.stderr,
-            )
+            if not should_allow_cpu_fallback(settings):
+                raise RuntimeError(
+                    "Voice-Orb generation hit a meta-tensor failure. "
+                    "CPU fallback is disabled to avoid large host-RAM spikes. "
+                    "Try setting device='mps' with dtype='float16' or enable allow_cpu_fallback explicitly."
+                ) from exc
+            print("Voice-Orb: meta-tensor generation failed; retrying on CPU fallback.", file=sys.stderr)
             unload_loaded_model()
             model = load_model(force_fallback=True)
             runtime_device, runtime_dtype = resolve_runtime_backend(model)
@@ -351,18 +394,29 @@ def synthesize(arguments: dict[str, Any], preview: bool) -> dict[str, Any]:
         output_name = f"voice_orb_{suffix}_{stamp}.wav"
         output_path = output_dir / output_name
         soundfile_module.write(output_path, audio, sample_rate)
+        rss_after_mb = current_rss_mb()
+        budget_exceeded = rss_after_mb is not None and rss_after_mb >= max_rss_mb
         return {
             "kind": "json",
             "data": {
                 "status": "ok",
                 "tool": "voice_orb_preview" if preview else "voice_orb_speak",
                 "model_ref": STATE.loaded_model_ref,
+                "configured_model_ref": configured_model_ref,
                 "sample_rate": sample_rate,
                 "voice_description": voice_description,
                 "path": str(output_path),
                 "runtime_device": runtime_device,
                 "runtime_dtype": runtime_dtype,
                 "max_new_tokens": generation_kwargs["max_new_tokens"],
+                "input_chars": len(text),
+                "input_was_truncated": input_was_truncated,
+                "already_loaded_before_call": already_loaded_before_call,
+                "rss_before_mb": rss_before_mb,
+                "rss_after_mb": rss_after_mb,
+                "max_rss_mb": max_rss_mb,
+                "budget_exceeded": budget_exceeded,
+                **runtime_status_fields(),
                 "media": [
                     {
                         "filename": output_name,
@@ -376,7 +430,7 @@ def synthesize(arguments: dict[str, Any], preview: bool) -> dict[str, Any]:
         }
     finally:
         wavs = None
-        if should_unload_after_synthesis:
+        if should_unload_after_synthesis or budget_exceeded:
             unload_loaded_model()
         else:
             cleanup_inference_memory(model)
@@ -412,10 +466,12 @@ def load_model(force_fallback: bool = False) -> Any:
     except RuntimeError as exc:
         if "meta tensor" not in str(exc).lower() or force_fallback:
             raise
-        print(
-            "Voice-Orb: meta-tensor error during model load; retrying with safe fallback strategy.",
-            file=sys.stderr,
-        )
+        if not should_allow_cpu_fallback(settings):
+            raise RuntimeError(
+                "Voice-Orb model load hit meta tensors and CPU fallback is disabled. "
+                "Set dtype='float16' on MPS or enable allow_cpu_fallback explicitly."
+            ) from exc
+        print("Voice-Orb: meta-tensor load failure; retrying on CPU fallback.", file=sys.stderr)
         return load_model(force_fallback=True)
 
     if model_has_meta_tensors(loaded_model):
@@ -424,14 +480,18 @@ def load_model(force_fallback: bool = False) -> Any:
                 "Voice-Orb model resolved with meta tensors even in fallback mode. "
                 "Try CPU + float32, reinstall dependencies, or clear model cache."
             )
-        print(
-            "Voice-Orb: model loaded with meta tensors; retrying with safe fallback strategy.",
-            file=sys.stderr,
-        )
+        if not should_allow_cpu_fallback(settings):
+            raise RuntimeError(
+                "Voice-Orb model resolved with meta tensors and CPU fallback is disabled. "
+                "Try dtype='float16' on MPS or enable allow_cpu_fallback explicitly."
+            )
+        print("Voice-Orb: model loaded with meta tensors; retrying on CPU fallback.", file=sys.stderr)
         return load_model(force_fallback=True)
 
     STATE.loaded_model = loaded_model
     STATE.loaded_model_ref = model_ref
+    STATE.model_load_count += 1
+    STATE.last_loaded_utc = datetime.now(timezone.utc).isoformat()
     return STATE.loaded_model
 
 
@@ -448,6 +508,80 @@ def parse_int(value: Any, default_value: int) -> int:
         return int(value)
     except Exception:
         return default_value
+
+
+def parse_float(value: Any, default_value: float) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return default_value
+
+
+def coerce_bool(value: Any, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    return default
+
+
+def current_rss_mb() -> float | None:
+    try:
+        output = subprocess.check_output(
+            ["ps", "-o", "rss=", "-p", str(os.getpid())],
+            text=True,
+        ).strip()
+        if not output:
+            return None
+        # `ps rss` reports KiB on macOS and Linux.
+        return max(0.0, int(output) / 1024.0)
+    except Exception:
+        return None
+
+
+def resolve_max_rss_mb(settings: dict[str, Any]) -> float:
+    configured = parse_float(settings.get("max_rss_mb"), DEFAULT_MAX_RSS_MB)
+    return max(2_000.0, min(configured, 131_072.0))
+
+
+def current_configured_model_ref() -> str:
+    settings = STATE.merged_settings()
+    return str(settings.get("model_ref") or "").strip()
+
+
+def is_model_loaded_for_ref(model_ref: str) -> bool:
+    return (
+        STATE.loaded_model is not None
+        and STATE.loaded_model_ref is not None
+        and STATE.loaded_model_ref == model_ref
+    )
+
+
+def runtime_status_fields() -> dict[str, Any]:
+    return {
+        "pid": os.getpid(),
+        "instance_id": STATE.instance_id,
+        "plugin_started_at_utc": STATE.startup_utc,
+        "model_load_count": STATE.model_load_count,
+        "last_loaded_at_utc": STATE.last_loaded_utc,
+        "rss_mb": current_rss_mb(),
+    }
+
+
+def should_allow_cpu_fallback(settings: dict[str, Any]) -> bool:
+    return coerce_bool(settings.get("allow_cpu_fallback"), False)
+
+
+def bound_input_text(text: str, settings: dict[str, Any]) -> tuple[str, bool]:
+    limit = parse_int(settings.get("max_input_chars"), DEFAULT_MAX_INPUT_CHARS)
+    safe_limit = max(120, min(limit, 12_000))
+    if len(text) <= safe_limit:
+        return text, False
+    return text[:safe_limit].rstrip(), True
 
 
 def generate_voice_design(
@@ -547,6 +681,13 @@ def release_torch_memory() -> None:
     except Exception:
         pass
 
+    try:
+        mps_module = getattr(torch_module, "mps", None)
+        if mps_module is not None and hasattr(mps_module, "empty_cache"):
+            mps_module.empty_cache()
+    except Exception:
+        pass
+
     gc.collect()
 
 
@@ -599,9 +740,10 @@ def build_model_load_kwargs(
             "float32": torch_module.float32,
         }
         kwargs["dtype"] = dtype_map.get(dtype_name, torch_module.float32)
-    elif device_target in {"cpu", "mps"}:
-        # Auto dtype on non-CUDA backends can be unstable depending on env.
+    elif device_target == "cpu":
         kwargs["dtype"] = torch_module.float32
+    elif device_target == "mps":
+        kwargs["dtype"] = torch_module.float16
 
     attention_impl = str(settings.get("attention_impl") or "auto").strip()
     if attention_impl and attention_impl != "auto":

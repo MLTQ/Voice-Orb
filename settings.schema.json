@@ -117,18 +117,39 @@
       "default_value": false
     },
     {
+      "key": "allow_cpu_fallback",
+      "title": "Allow CPU Fallback",
+      "kind": "boolean",
+      "help": "If enabled, meta-tensor failures may retry on CPU (can dramatically increase RAM use).",
+      "default_value": false
+    },
+    {
+      "key": "max_input_chars",
+      "title": "Max Input Characters",
+      "kind": "number",
+      "help": "Clamp very long text before synthesis to keep generation memory bounded.",
+      "default_value": 900
+    },
+    {
+      "key": "max_rss_mb",
+      "title": "Max RSS (MB)",
+      "kind": "number",
+      "help": "Soft per-process memory budget. Voice-Orb refuses synthesis above this and unloads when exceeded.",
+      "default_value": 14000
+    },
+    {
       "key": "max_new_tokens",
       "title": "Max New Tokens",
       "kind": "number",
       "help": "Upper token budget for speech generation. Clamped to a safe range in runtime.",
-      "default_value": 640
+      "default_value": 384
     },
     {
       "key": "unload_after_synthesis",
       "title": "Unload After Synthesis",
       "kind": "boolean",
-      "help": "Unload the model after each clip to prevent long-lived RAM growth.",
-      "default_value": true
+      "help": "Unload model after each clip (lower idle RAM, but can cause spikes/reload stalls on some backends).",
+      "default_value": false
     },
     {
       "key": "top_p",
