@@ -120,7 +120,15 @@
       "key": "max_new_tokens",
       "title": "Max New Tokens",
       "kind": "number",
-      "default_value": 2048
+      "help": "Upper token budget for speech generation. Clamped to a safe range in runtime.",
+      "default_value": 640
+    },
+    {
+      "key": "unload_after_synthesis",
+      "title": "Unload After Synthesis",
+      "kind": "boolean",
+      "help": "Unload the model after each clip to prevent long-lived RAM growth.",
+      "default_value": true
     },
     {
       "key": "top_p",

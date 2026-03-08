@@ -2,6 +2,7 @@ import json
 import os
 import sys
 import contextlib
+import gc
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -10,6 +11,10 @@ from typing import Any
 from voice_orb import __version__
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_MAX_NEW_TOKENS = 640
+MIN_MAX_NEW_TOKENS = 64
+MAX_MAX_NEW_TOKENS = 1024
+PREVIEW_MAX_NEW_TOKENS = 320
 
 
 @dataclass
@@ -38,7 +43,8 @@ class PluginState:
             ),
             "allow_persona_drift": True,
             "auto_speak_replies": False,
-            "max_new_tokens": 2048,
+            "unload_after_synthesis": True,
+            "max_new_tokens": DEFAULT_MAX_NEW_TOKENS,
             "top_p": 0.9,
             "top_k": 50,
             "temperature": 0.7,
@@ -181,6 +187,7 @@ def configure(params: dict[str, Any]) -> dict[str, Any]:
         settings = {}
     if not isinstance(settings, dict):
         raise ValueError("plugin.configure expects an object settings payload")
+    unload_loaded_model()
     STATE.settings = dict(settings)
     return {"configured": True}
 
@@ -205,13 +212,15 @@ def get_prompt_contributions(params: dict[str, Any]) -> dict[str, Any]:
     contributions: list[dict[str, Any]] = []
     settings = STATE.merged_settings()
 
-    if slot == "engaged_instructions" or slot == "engaged.instructions":
+    if (
+        (slot == "engaged_instructions" or slot == "engaged.instructions")
+        and settings.get("auto_speak_replies")
+    ):
         text = (
             "If audible speech would help, you may call `voice_orb_speak` "
             "to synthesize your reply using the current voice design."
         )
-        if settings.get("auto_speak_replies"):
-            text += " Auto-speak is enabled, so speaking finalized replies is allowed when appropriate."
+        text += " Auto-speak is enabled, so speaking finalized replies is allowed when appropriate."
         contributions.append(
             {
                 "plugin_id": "voice-orb",
@@ -248,12 +257,15 @@ def invoke_tool(params: dict[str, Any]) -> dict[str, Any]:
 
     if tool_name == "voice_orb_ensure_model":
         model = load_model()
+        runtime_device, runtime_dtype = resolve_runtime_backend(model)
         return {
             "kind": "json",
             "data": {
                 "status": "ok",
                 "model_ref": STATE.loaded_model_ref,
                 "model_loaded": model is not None,
+                "runtime_device": runtime_device,
+                "runtime_dtype": runtime_dtype,
             },
         }
 
@@ -284,9 +296,11 @@ def synthesize(arguments: dict[str, Any], preview: bool) -> dict[str, Any]:
     seed_value = arguments.get("seed")
 
     model = load_model()
+    runtime_device, runtime_dtype = resolve_runtime_backend(model)
+    should_unload_after_synthesis = bool(settings.get("unload_after_synthesis", True))
 
     generation_kwargs: dict[str, Any] = {
-        "max_new_tokens": int(settings.get("max_new_tokens", 2048)),
+        "max_new_tokens": resolve_max_new_tokens(settings, preview),
         "top_p": float(settings.get("top_p", 0.9)),
         "top_k": int(settings.get("top_k", 50)),
         "temperature": float(settings.get("temperature", 0.7)),
@@ -295,60 +309,77 @@ def synthesize(arguments: dict[str, Any], preview: bool) -> dict[str, Any]:
     if seed_value is not None:
         generation_kwargs["seed"] = int(seed_value)
 
+    wavs = None
+    sample_rate = None
+    output_path = None
+    output_name = None
     try:
-        wavs, sample_rate = model.generate_voice_design(
-            text=text,
-            language=language,
-            instruct=voice_description,
-            **generation_kwargs,
-        )
-    except RuntimeError as exc:
-        # Some environments can resolve a partially materialized model (meta tensors).
-        # Retry once with an explicit safe fallback load strategy.
-        if "meta tensor" not in str(exc).lower():
-            raise
-        print(
-            "Voice-Orb: detected meta-tensor generation failure; retrying with safe fallback load.",
-            file=sys.stderr,
-        )
-        STATE.loaded_model = None
-        STATE.loaded_model_ref = None
-        model = load_model(force_fallback=True)
-        wavs, sample_rate = model.generate_voice_design(
-            text=text,
-            language=language,
-            instruct=voice_description,
-            **generation_kwargs,
-        )
+        try:
+            wavs, sample_rate = generate_voice_design(
+                model=model,
+                text=text,
+                language=language,
+                voice_description=voice_description,
+                generation_kwargs=generation_kwargs,
+            )
+        except RuntimeError as exc:
+            # Some environments can resolve a partially materialized model (meta tensors).
+            # Retry once with an explicit safe fallback load strategy.
+            if "meta tensor" not in str(exc).lower():
+                raise
+            print(
+                "Voice-Orb: detected meta-tensor generation failure; retrying with safe fallback load.",
+                file=sys.stderr,
+            )
+            unload_loaded_model()
+            model = load_model(force_fallback=True)
+            runtime_device, runtime_dtype = resolve_runtime_backend(model)
+            wavs, sample_rate = generate_voice_design(
+                model=model,
+                text=text,
+                language=language,
+                voice_description=voice_description,
+                generation_kwargs=generation_kwargs,
+            )
 
-    audio = wavs[0]
-    output_dir = ensure_directory(resolve_repo_path(str(settings.get("output_dir") or "./data/output")))
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    suffix = "preview" if preview else "speak"
-    output_name = f"voice_orb_{suffix}_{stamp}.wav"
-    output_path = output_dir / output_name
-    soundfile_module.write(output_path, audio, sample_rate)
-
-    return {
-        "kind": "json",
-        "data": {
-            "status": "ok",
-            "tool": "voice_orb_preview" if preview else "voice_orb_speak",
-            "model_ref": STATE.loaded_model_ref,
-            "sample_rate": sample_rate,
-            "voice_description": voice_description,
-            "path": str(output_path),
-            "media": [
-                {
-                    "filename": output_name,
-                    "path": str(output_path),
-                    "media_kind": "audio",
-                    "mime_type": "audio/wav",
-                    "source": "voice-orb"
-                }
-            ]
-        },
-    }
+        audio = normalize_audio_payload(wavs[0])
+        output_dir = ensure_directory(
+            resolve_repo_path(str(settings.get("output_dir") or "./data/output"))
+        )
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        suffix = "preview" if preview else "speak"
+        output_name = f"voice_orb_{suffix}_{stamp}.wav"
+        output_path = output_dir / output_name
+        soundfile_module.write(output_path, audio, sample_rate)
+        return {
+            "kind": "json",
+            "data": {
+                "status": "ok",
+                "tool": "voice_orb_preview" if preview else "voice_orb_speak",
+                "model_ref": STATE.loaded_model_ref,
+                "sample_rate": sample_rate,
+                "voice_description": voice_description,
+                "path": str(output_path),
+                "runtime_device": runtime_device,
+                "runtime_dtype": runtime_dtype,
+                "max_new_tokens": generation_kwargs["max_new_tokens"],
+                "media": [
+                    {
+                        "filename": output_name,
+                        "path": str(output_path),
+                        "media_kind": "audio",
+                        "mime_type": "audio/wav",
+                        "source": "voice-orb",
+                    }
+                ],
+            },
+        }
+    finally:
+        wavs = None
+        if should_unload_after_synthesis:
+            unload_loaded_model()
+        else:
+            cleanup_inference_memory(model)
 
 
 def load_model(force_fallback: bool = False) -> Any:
@@ -364,6 +395,8 @@ def load_model(force_fallback: bool = False) -> Any:
         and STATE.loaded_model_ref == model_ref
     ):
         return STATE.loaded_model
+    if STATE.loaded_model is not None:
+        unload_loaded_model()
 
     cache_dir = ensure_directory(resolve_repo_path(str(settings.get("cache_dir") or "./data/models")))
     os.environ["HF_HOME"] = str(cache_dir)
@@ -400,6 +433,121 @@ def load_model(force_fallback: bool = False) -> Any:
     STATE.loaded_model = loaded_model
     STATE.loaded_model_ref = model_ref
     return STATE.loaded_model
+
+
+def resolve_max_new_tokens(settings: dict[str, Any], preview: bool) -> int:
+    raw_max = parse_int(settings.get("max_new_tokens"), DEFAULT_MAX_NEW_TOKENS)
+    bounded = max(MIN_MAX_NEW_TOKENS, min(raw_max, MAX_MAX_NEW_TOKENS))
+    if preview:
+        return min(bounded, PREVIEW_MAX_NEW_TOKENS)
+    return bounded
+
+
+def parse_int(value: Any, default_value: int) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return default_value
+
+
+def generate_voice_design(
+    model: Any,
+    text: str,
+    language: str,
+    voice_description: str,
+    generation_kwargs: dict[str, Any],
+) -> tuple[Any, Any]:
+    torch_module = STATE.torch_module
+    inference_mode = getattr(torch_module, "inference_mode", None) if torch_module else None
+    if callable(inference_mode):
+        with inference_mode():
+            return model.generate_voice_design(
+                text=text,
+                language=language,
+                instruct=voice_description,
+                **generation_kwargs,
+            )
+    return model.generate_voice_design(
+        text=text,
+        language=language,
+        instruct=voice_description,
+        **generation_kwargs,
+    )
+
+
+def resolve_runtime_backend(model: Any) -> tuple[str, str]:
+    for candidate in iter_candidate_modules(model):
+        parameters = getattr(candidate, "parameters", None)
+        if not callable(parameters):
+            continue
+        try:
+            first_parameter = next(parameters())
+            device = getattr(first_parameter, "device", None)
+            dtype = getattr(first_parameter, "dtype", None)
+            device_name = str(device) if device is not None else "unknown"
+            dtype_name = str(dtype) if dtype is not None else "unknown"
+            return device_name, dtype_name
+        except StopIteration:
+            continue
+        except Exception:
+            continue
+    return "unknown", "unknown"
+
+
+def normalize_audio_payload(audio: Any) -> Any:
+    if hasattr(audio, "detach"):
+        try:
+            tensor = audio.detach()
+            if hasattr(tensor, "float"):
+                tensor = tensor.float()
+            if hasattr(tensor, "cpu"):
+                tensor = tensor.cpu()
+            if hasattr(tensor, "numpy"):
+                return tensor.numpy()
+            return tensor
+        except Exception:
+            return audio
+    return audio
+
+
+def cleanup_inference_memory(model: Any) -> None:
+    for candidate in iter_candidate_modules(model):
+        for method_name in ("clear_kv_cache", "clear_cache", "reset_cache"):
+            method = getattr(candidate, method_name, None)
+            if callable(method):
+                try:
+                    method()
+                except Exception:
+                    pass
+    release_torch_memory()
+
+
+def unload_loaded_model() -> None:
+    model = STATE.loaded_model
+    STATE.loaded_model = None
+    STATE.loaded_model_ref = None
+    if model is None:
+        return
+
+    del model
+    release_torch_memory()
+
+
+def release_torch_memory() -> None:
+    torch_module = STATE.torch_module
+    if torch_module is None:
+        gc.collect()
+        return
+
+    try:
+        if torch_module.cuda.is_available():
+            torch_module.cuda.empty_cache()
+            if hasattr(torch_module.cuda, "ipc_collect"):
+                torch_module.cuda.ipc_collect()
+    except Exception:
+        pass
+
+    gc.collect()
 
 
 def ensure_qwen_runtime() -> tuple[Any, Any]:
