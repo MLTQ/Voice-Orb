@@ -2,3 +2,7 @@
 voice_orb/__pycache__/
 
 .DS_Store
+
+.venv-py3.11/
+
+data/

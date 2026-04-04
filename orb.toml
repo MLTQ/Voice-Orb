@@ -1,0 +1,54 @@
+id = "voice-orb"
+name = "Voice-Orb"
+version = "0.1.0"
+description = "Qwen3-TTS voice-note orb"
+kind = "media.voice"
+
+[capabilities]
+verbs = ["speak", "verify"]
+media_in = ["text"]
+media_out = ["audio/ogg", "audio/wav"]
+streaming = false
+
+[runtime]
+adapter = "shell-helper"
+install_command = "./scripts/install_portable.sh"
+verify_command = "./scripts/voice_note.sh \"orb verification\""
+default_action = "speak"
+
+[helpers]
+default_invoke = "./scripts/voice_note.sh"
+usage_doc = "./scripts/voice_note.md"
+
+[config]
+schema = "./settings.schema.json"
+
+[config.defaults]
+model_ref = "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
+language = "english"
+device = "cuda"
+dtype = "bfloat16"
+attention_impl = "eager"
+max_new_tokens = "auto"
+unload_after_synthesis = true
+
+[artifacts]
+output_dir = "./data/output"
+default_extension = ".ogg"
+
+[health]
+checks = ["./scripts/voice_note.sh --help"]
+
+[actions.speak]
+command = "./scripts/voice_note.sh"
+primary_arg = "text"
+primary_arg_mode = "positional"
+success_artifact_glob = "voice_note_*.ogg"
+description = "Generate a voice note from text."
+
+[actions.verify]
+command = "./scripts/voice_note.sh"
+primary_arg = "text"
+primary_arg_mode = "positional"
+success_artifact_glob = "voice_note_*.ogg"
+description = "Smoke-test voice note generation."

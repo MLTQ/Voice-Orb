@@ -1,0 +1,10 @@
+README.md
+pyproject.toml
+voice_orb/__init__.py
+voice_orb/bootstrap.py
+voice_orb/server.py
+voice_orb.egg-info/PKG-INFO
+voice_orb.egg-info/SOURCES.txt
+voice_orb.egg-info/dependency_links.txt
+voice_orb.egg-info/requires.txt
+voice_orb.egg-info/top_level.txt

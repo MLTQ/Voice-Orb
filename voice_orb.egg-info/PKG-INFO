@@ -1,0 +1,36 @@
+Metadata-Version: 2.4
+Name: voice-orb
+Version: 0.1.0
+Summary: Portable Qwen3-TTS runtime plugin for Ponderer
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: qwen-tts
+Requires-Dist: soundfile
+
+# Voice-Orb
+
+`Voice-Orb` is a portable `runtime_process` plugin for Ponderer that adds direct Qwen3-TTS voice-design speech synthesis without requiring ComfyUI.
+
+## What It Does
+
+- Accepts natural-language voice descriptions plus text
+- Synthesizes speech with Qwen3-TTS VoiceDesign
+- Stores model downloads inside the plugin folder for portability
+- Exposes tool methods to Ponderer through the runtime plugin host
+
+## Layout
+
+- `plugin.toml`: Ponderer runtime plugin manifest
+- `settings.schema.json`: declarative settings tab schema
+- `voice_orb/server.py`: stdio JSON-RPC server
+- `scripts/install_portable.sh`: creates a local virtualenv and installs dependencies
+- `scripts/run_plugin.sh`: launches the plugin server from the local virtualenv
+- `scripts/install_to_ponderer.sh`: symlinks this repo into a Ponderer `plugins/` directory
+
+## Portable Usage
+
+1. Run `./scripts/install_portable.sh`
+2. Enable the plugin in Ponderer settings
+3. Let Ponderer launch it from `plugins/voice-orb`
+
+For a fully portable bundle, keep the entire `voice-orb` directory together with its `.venv` and `data/` folders.

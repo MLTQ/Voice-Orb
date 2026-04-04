@@ -1,10 +1,9 @@
 import argparse
 import os
-import sys
 
 from voice_orb import server
 
-DEFAULT_TOKENIZER_REF = "Qwen/Qwen3-TTS-Tokenizer-12Hz"
+DEFAULT_MODEL_REF = "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
 
 
 def main() -> int:
@@ -12,7 +11,7 @@ def main() -> int:
     parser.add_argument(
         "--prefetch-hf-assets",
         action="store_true",
-        help="Download the configured tokenizer and model into the local Hugging Face cache.",
+        help="Download the configured model into the local Hugging Face cache.",
     )
     parser.add_argument(
         "--download-model",
@@ -58,23 +57,13 @@ def prefetch_hf_assets(model_ref: str | None, cache_dir: str | None) -> None:
             "huggingface_hub is not installed. Run ./scripts/install_portable.sh inside the Voice-Orb repo."
         ) from exc
 
-    effective_model_ref = (model_ref or "").strip() or "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
+    effective_model_ref = (model_ref or "").strip() or DEFAULT_MODEL_REF
     effective_cache_dir = cache_dir or "./data/models"
     resolved_cache_dir = server.ensure_directory(
         server.resolve_repo_path(str(effective_cache_dir))
     )
-    tokenizer_ref = os.environ.get("VOICE_ORB_TOKENIZER_REF", "").strip() or DEFAULT_TOKENIZER_REF
 
-    print(
-        f"Prefetching Voice-Orb tokenizer ({tokenizer_ref}) into {resolved_cache_dir}...",
-        file=sys.stderr,
-    )
-    snapshot_download(repo_id=tokenizer_ref, cache_dir=str(resolved_cache_dir))
-
-    print(
-        f"Prefetching Voice-Orb model ({effective_model_ref}) into {resolved_cache_dir}...",
-        file=sys.stderr,
-    )
+    print(f"Prefetching Voice-Orb model ({effective_model_ref}) into {resolved_cache_dir}...")
     snapshot_download(repo_id=effective_model_ref, cache_dir=str(resolved_cache_dir))
 
 
